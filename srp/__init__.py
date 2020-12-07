@@ -8,13 +8,6 @@ except ImportError:
     pass
 
 if not _mod:
-    try:
-        import srp._ctsrp
-        _mod = srp._ctsrp
-    except ImportError:
-        pass
-    
-if not _mod:
     import srp._pysrp
     _mod = srp._pysrp
 
