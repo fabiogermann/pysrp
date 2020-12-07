@@ -16,6 +16,15 @@
 import hashlib
 import os
 import binascii
+import six
+
+
+_rfc5054_compat = False
+
+def rfc5054_enable(enable=True):
+    global _rfc5054_compat
+    _rfc5054_compat = enable
+
 
 SHA1   = 0
 SHA224 = 1
@@ -34,7 +43,7 @@ _hash_map = { SHA1   : hashlib.sha1,
               SHA256 : hashlib.sha256,
               SHA384 : hashlib.sha384,
               SHA512 : hashlib.sha512 }
-              
+
 
 _ng_const = (
 # 1024-bit
@@ -125,12 +134,12 @@ def get_ng( ng_type, n_hex, g_hex ):
               
 
 def bytes_to_long(s):
-    n = ord(s[0])
-    for b in ( ord(x) for x in s[1:] ):
+    n = 0
+    for b in six.iterbytes(s):
         n = (n << 8) | b
     return n
-    
-    
+
+
 def long_to_bytes(n):
     l = list()
     x = 0
@@ -141,74 +150,106 @@ def long_to_bytes(n):
         x = x | (b << off)
         off += 8
     l.reverse()
-    return ''.join(l)
+    return six.b(''.join(l))
 
-    
+def mulModN(fac1, fac2, mod):
+    return ((fac1 % mod) * (fac2 % mod)) % mod
+
 def get_random( nbytes ):
     return bytes_to_long( os.urandom( nbytes ) )
 
-    
+
+def get_random_of_length( nbytes ):
+    offset = (nbytes*8) - 1
+    return get_random( nbytes ) | (1 << offset)
+
+
 def old_H( hash_class, s1, s2 = '', s3=''):
-    if isinstance(s1, (long, int)):
+    if isinstance(s1, six.integer_types):
         s1 = long_to_bytes(s1)
-    if s2 and isinstance(s2, (long, int)):
+    if s2 and isinstance(s2, six.integer_types):
         s2 = long_to_bytes(s2)
-    if s3 and isinstance(s3, (long, int)):
+    if s3 and isinstance(s3, six.integer_types):
         s3 = long_to_bytes(s3)
     s = s1 + s2 + s3
     return long(hash_class(s).hexdigest(), 16)
-    
-    
+
+
 def H( hash_class, *args, **kwargs ):
-    h = hash_class()
+    width = kwargs.get('width', None)
     
+    h = hash_class()
+
     for s in args:
         if s is not None:
-            h.update( long_to_bytes(s) if isinstance(s, (long, int)) else s )
+            data = long_to_bytes(s) if isinstance(s, six.integer_types) else s
+            if width is not None and _rfc5054_compat:
+                h.update( bytes(width - len(data)))
+            h.update( data )
+    return int( h.hexdigest(), 16 )
 
-    return long( h.hexdigest(), 16 )
+def H_nn_rfc5054( hash_class, N, n1, n2 ):
+    bin_N  = long_to_bytes(N)
+    bin_n1 = long_to_bytes(n1)
+    bin_n2 = long_to_bytes(n2)
+
+    head   = '\0'*(len(bin_N)-len(bin_n1))
+    middle = '\0'*(len(bin_N)-len(bin_n2))
+
+    return H( hash_class, head, bin_n1, middle, bin_n2 )
 
 
+H_nn_orig = H
 
 #N = 0xAC6BDB41324A9A9BF166DE5E1389582FAF72B6651987EE07FC3192943DB56050A37329CBB4A099ED8193E0757767A13DD52312AB4B03310DCD7F48A9DA04FD50E8083969EDB767B0CF6095179A163AB3661A05FBD5FAAAE82918A9962F0B93B855F97993EC975EEAA80D740ADBF4FF747359D041D5C33EA71D281E446B14773BCA97B43A23FB801676BD207A436C6481F1D2B9078717461A5B9D32E688F87748544523B524B0D57D5EA77A2775D2ECFA032CFBDBF52FB3786160279004E57AE6AF874E7303CE53299CCC041C7BC308D82A5698F3A8D0C38271AE35F8E9DBFBB694B5C803D89F7AE435DE236D525F54759B65E372FCD68EF20FA7111F9E4AFF73;
 #g = 2;    
 #k = H(N,g)  
 
 def HNxorg( hash_class, N, g ):
-    hN = hash_class( long_to_bytes(N) ).digest()
-    hg = hash_class( long_to_bytes(g) ).digest()
+    bin_N = long_to_bytes(N)
+    bin_g = long_to_bytes(g)
 
-    return ''.join( chr( ord(hN[i]) ^ ord(hg[i]) ) for i in range(0,len(hN)) )
-    
-    
-    
+    padding = len(bin_N) - len(bin_g) if _rfc5054_compat else 0
+
+    hN = hash_class( bin_N ).digest()
+    hg = hash_class( b''.join( [b'\0'*padding, bin_g] ) ).digest()
+
+    return six.b( ''.join( chr( six.indexbytes(hN, i) ^ six.indexbytes(hg, i) ) for i in range(0,len(hN)) ) )
+
+
+
 def gen_x( hash_class, salt, username, password ):
-    return H( hash_class, salt, H( hash_class, username + ':' + password ) )
-    
-    
-    
-    
-def create_salted_verification_key( username, password, hash_alg=SHA1, ng_type=NG_2048, n_hex=None, g_hex=None ):
+    username = username.encode() if hasattr(username, 'encode') else username
+    password = password.encode() if hasattr(password, 'encode') else password
+    return H( hash_class, salt, H( hash_class, username + six.b(':') + password ) )
+
+
+
+
+def create_salted_verification_key( username, password, hash_alg=SHA1, ng_type=NG_2048, n_hex=None, g_hex=None, salt_len=4 ):
     if ng_type == NG_CUSTOM and (n_hex is None or g_hex is None):
         raise ValueError("Both n_hex and g_hex are required when ng_type = NG_CUSTOM")
     hash_class = _hash_map[ hash_alg ]
     N,g = get_ng( ng_type, n_hex, g_hex )
-    _s = long_to_bytes( get_random( 4 ) )
+    _s = long_to_bytes( get_random( salt_len ) )
     _v = long_to_bytes( pow(g,  gen_x( hash_class, _s, username, password ), N) )
-    
+
     return _s, _v
     
 
-    
 def calculate_M( hash_class, N, g, I, s, A, B, K ):
-    h = hash_class()
-    h.update( HNxorg( hash_class, N, g ) )
-    h.update( hash_class(I).digest() )
-    h.update( long_to_bytes(s) )
-    h.update( long_to_bytes(A) )
-    h.update( long_to_bytes(B) )
-    h.update( K )
-    return h.digest()
+    #predef2 = hash_class( HNxorg( hash_class, N, g ) ).digest()
+    #print 'Calced predefHash: 928ade491bc87bba9eb578701d44d30ed9080e60e542ba0d3b9c20ded9f592bf'
+    #print '                   '+binascii.hexlify(predef2)
+    predef = binascii.unhexlify("928ade491bc87bba9eb578701d44d30ed9080e60e542ba0d3b9c20ded9f592bf")
+    hashUser = hash_class(I).digest()
+    tmp = b"".join([predef, hashUser])
+    tmp = b"".join([tmp, long_to_bytes(s)])
+    tmp = b"".join([tmp, long_to_bytes(A)])
+    tmp = b"".join([tmp, long_to_bytes(B)])
+    tmp = b"".join([tmp, K])
+    
+    return hash_class(tmp).digest()
 
 
 def calculate_H_AMK( hash_class, A, M, K ):
@@ -223,44 +264,65 @@ def calculate_H_AMK( hash_class, A, M, K ):
   
 class Verifier (object):
   
-    def __init__(self, username, bytes_s, bytes_v, bytes_A, hash_alg=SHA1, ng_type=NG_2048, n_hex=None, g_hex=None):
+    def __init__(self, username, bytes_s, bytes_v, bytes_A, hash_alg=SHA1, ng_type=NG_2048, n_hex=None, g_hex=None, bytes_b=None):
         if ng_type == NG_CUSTOM and (n_hex is None or g_hex is None):
             raise ValueError("Both n_hex and g_hex are required when ng_type = NG_CUSTOM")
+        if bytes_b and len(bytes_b) != 32:
+            raise ValueError("32 bytes required for bytes_b")
         self.s = bytes_to_long(bytes_s)
         self.v = bytes_to_long(bytes_v)
         self.I = username
         self.K = None
         self._authenticated = False
-        
+
         N,g        = get_ng( ng_type, n_hex, g_hex )
         hash_class = _hash_map[ hash_alg ]
-        k          = H( hash_class, N, g )
-        
+        k          = H( hash_class, N, g, width=len(long_to_bytes(N)) )
+
         self.hash_class = hash_class
         self.N          = N
         self.g          = g
         self.k          = k
-        
+
         self.A = bytes_to_long(bytes_A)
-        
+
         # SRP-6a safety check
         self.safety_failed = self.A % N == 0
-        
+
         if not self.safety_failed:
-            
-            self.b = get_random( 32 )
+
+            if bytes_b:
+                self.b = bytes_to_long(bytes_b)
+            else:
+                self.b = get_random_of_length( 32 )
             self.B = (k*self.v + pow(g, self.b, N)) % N
-            self.u = H(hash_class, self.A, self.B)
+            self.u = H(hash_class, self.A, self.B, width=len(long_to_bytes(N)))
             self.S = pow(self.A*pow(self.v, self.u, N ), self.b, N)
             self.K = hash_class( long_to_bytes(self.S) ).digest()
             self.M = calculate_M( hash_class, N, g, self.I, self.s, self.A, self.B, self.K )
             self.H_AMK = calculate_H_AMK( hash_class, self.A, self.M, self.K )
-        
-        
+
+
+    def debug_set_public_b(self, public_b):
+        self.B = bytes_to_long(public_b)
+        self.u = H(self.hash_class, self.A, self.B, width=len(long_to_bytes(self.N)))
+
+
+    def debug_set_precomputed_s(self, comp_s):
+        self.S = bytes_to_long(comp_s)
+        self.K = self.hash_class( long_to_bytes(self.S) ).digest()
+        self.M = calculate_M( self.hash_class, self.N, self.g, self.I, self.s, self.A, self.B, self.K )
+        self.H_AMK = calculate_H_AMK( self.hash_class, self.A, self.M, self.K )
+
+
     def authenticated(self):
         return self._authenticated
     
-    
+
+    def get_ephemeral_secret(self):
+        return long_to_bytes(self.b)
+
+
     def get_username(self):
         return self.I
     
@@ -268,6 +330,7 @@ class Verifier (object):
     def get_session_key(self):
         return self.K if self._authenticated else None
         
+
     # returns (bytes_s, bytes_B) on success, (None,None) if SRP-6a safety check fails
     def get_challenge(self):
         if self.safety_failed:
@@ -285,29 +348,37 @@ class Verifier (object):
         
         
 class User (object):
-    def __init__(self, username, password, hash_alg=SHA1, ng_type=NG_2048, n_hex=None, g_hex=None):
+    def __init__(self, username, password, hash_alg=SHA1, ng_type=NG_2048, n_hex=None, g_hex=None, bytes_a=None, bytes_A=None):
         if ng_type == NG_CUSTOM and (n_hex is None or g_hex is None):
             raise ValueError("Both n_hex and g_hex are required when ng_type = NG_CUSTOM")
+        if bytes_a and len(bytes_a) != 32:
+            raise ValueError("32 bytes required for bytes_a")
         N,g        = get_ng( ng_type, n_hex, g_hex )
         hash_class = _hash_map[ hash_alg ]
-        k          = H( hash_class, N, g )
-        
+        k          = H( hash_class, N, g, width=len(long_to_bytes(N)) )
+
         self.I     = username
         self.p     = password
-        self.a     = get_random( 32 )
-        self.A     = pow(g, self.a, N)
+        if bytes_a:
+            self.a = bytes_to_long(bytes_a)
+        else:
+            self.a = get_random_of_length( 32 )
+        if bytes_A:
+            self.A = bytes_to_long(bytes_A)
+        else:
+            self.A = pow(g, self.a, N)
         self.v     = None
         self.M     = None
         self.K     = None
         self.H_AMK = None
         self._authenticated = False
-        
+
         self.hash_class = hash_class
         self.N          = N
         self.g          = g
         self.k          = k
-        
-    
+
+
     def authenticated(self):
         return self._authenticated
     
@@ -322,37 +393,68 @@ class User (object):
     
     def start_authentication(self):
         return (self.I, long_to_bytes(self.A))
-        
+
+    def debug_set_hash_k(self, bytes_k):
+        self.k = bytes_to_long(bytes_k)
     
     # Returns M or None if SRP-6a safety check is violated
     def process_challenge(self, bytes_s, bytes_B):
-
+        #print 'DEBUG salt: '+binascii.hexlify(bytes_s)
+        #print 'DEBUG pubB: '+binascii.hexlify(bytes_B)
         self.s = bytes_to_long( bytes_s )
         self.B = bytes_to_long( bytes_B )
         
         N = self.N
+        #print 'DEBUG N: '+binascii.hexlify(long_to_bytes(N))
         g = self.g
+        #print 'DEBUG g: '+binascii.hexlify(long_to_bytes(g))
         k = self.k
+        #print 'DEBUG k: '+binascii.hexlify(long_to_bytes(k))
         
         hash_class = self.hash_class
         
         # SRP-6a safety check
         if (self.B % N) == 0:
             return None
-        
-        self.u = H( hash_class, self.A, self.B )
+
+        self.u = H( hash_class, self.A, self.B, width=len(long_to_bytes(N)) )
         
         # SRP-6a safety check
         if self.u == 0:
             return None
-        
+        #print 'Expected u: 465df11c726f1a9e584486f0534e4e94356a3774c88fcbe045c20c57193a0b3e'
+        #print '            '+binascii.hexlify(long_to_bytes(self.u))
         self.x = gen_x( hash_class, self.s, self.I, self.p )
-        
+        #print 'Expected x: 89ac61c59a0cd4122bb23035fa8dcc183495f517de494983c1ac1d82eb79c1bd'
+        #print '            '+binascii.hexlify(long_to_bytes(self.x))
         self.v = pow(g, self.x, N)
-        
-        self.S = pow((self.B - k*self.v), (self.a + self.u*self.x), N)
-        
-        self.K     = hash_class( long_to_bytes(self.S) ).digest()        
+        #print 'Expected v: e5e7644d0e8d3dc6705640c2c78d6eb8dfb470e504d09508fe49a252faa576c3abbe4b49aceaa8f92e390480b438cccb076200dd10aa44d727fefdecf889d610b3419a7db49fd50bf24eea532b64a591f17ca9a66c045031ad9cd37e24b8b7ba179ad862d9d52e7718aae654fe96c8f4ccce6b0a53f65f837f4376878fd1ae8d'
+        #print '            '+binascii.hexlify(long_to_bytes(self.v))
+        #print 'Expected privA: 03f00a8f0903066d52da85a64298d2619e935e864a930f967554f4f0f282e818'
+        #print '                '+binascii.hexlify(long_to_bytes(self.a))
+        #self.S = pow((self.B - k*self.v), (self.a + self.u*self.x), N)
+        #self.S = bytes_to_long(binascii.unhexlify('56f0b8c81000d57880c7f2d5cd682cde54788de080a2aa03a3e6b77c9b0f42dcf1bfec241064f24e564848a2ecf6f53b26da53f3b22f3523aff881c19ce6157ac5567e6e51387a2f1e96d2d4dba1f7412defd778f115f980e1082a844ca1a27e0cc644093d00714f40a05bf35d54e35a95fdb47015eae466d1723832480cfa08'))
+        tmp1 = pow(self.g, self.x, N)
+        tmp2a = self.B + N
+        #print 'expected tmp2a: 14e6b45afb6b2649ce5ac6f2ac4736956cb5c4867b93cfde5c6bb3aaa6eeb4eafe1bb3e87660f981e9c96030991c334df4da8b470f0499609a809651d55a14cd0f37ce5b4e108c868b9cf3897758f09d21dfc4595a51d6f3c938947d9f61f1cc6a55d943144df404cf119de194c53a068494d061273887a68aa12b1a768980a98'
+        #print '                '+binascii.hexlify(long_to_bytes(tmp2a))
+        tmp2b = mulModN(tmp1, self.k, N)
+        #print 'expected tmp2b: d4581773d0409da6189ad2326188c059de388fa022734703bd98845fb7a5995d565122f3d8eaf7451a347d5a6f84d89f547a50d2908bb6bc5b6a418c2889cc8f5e3520105b35d1b639ced59eaecb3622cfcac6a04c6ebf897e828fada20d775574f510b0829ab1e4ea571b15cce705a86bc8cf21f4f697d33e3e29372d9efde1'
+        #print '                '+binascii.hexlify(long_to_bytes(tmp2b))
+        tmp2 = tmp2a - tmp2b
+        #tmp2 = self.B + N - mulModN(tmp1, self.k, N)
+        #print 'expected tmp2: 7a132e3be671c6f6cd119cf862eaa8fced23b8c796c9b6e20922b64ab745b5528b6a1b938d24a0d9826185af223e5c3ff92e639e5fbddf4d4c9f23912d1780419547c5a485d2f6b2800062f8c6c3d3af4e317ef558aeafb31506b82c5411a57130688380c2448e6806c2c3037f6c9abfdd8436f07e91e2956bd488703af90cb7'
+        #print '               '+binascii.hexlify(long_to_bytes(tmp2))
+        tmp3 = self.a + mulModN(self.u, self.x, N)
+        tmp4 = pow(tmp2, tmp3, N)
+        self.S = tmp4
+        #print 'Alternate:  '+binascii.hexlify(long_to_bytes(tmp4))
+        #print 'Expected S: 56f0b8c81000d57880c7f2d5cd682cde54788de080a2aa03a3e6b77c9b0f42dcf1bfec241064f24e564848a2ecf6f53b26da53f3b22f3523aff881c19ce6157ac5567e6e51387a2f1e96d2d4dba1f7412defd778f115f980e1082a844ca1a27e0cc644093d00714f40a05bf35d54e35a95fdb47015eae466d1723832480cfa08'
+        # this works self.S = bytes_to_long(binascii.unhexlify('56f0b8c81000d57880c7f2d5cd682cde54788de080a2aa03a3e6b77c9b0f42dcf1bfec241064f24e564848a2ecf6f53b26da53f3b22f3523aff881c19ce6157ac5567e6e51387a2f1e96d2d4dba1f7412defd778f115f980e1082a844ca1a27e0cc644093d00714f40a05bf35d54e35a95fdb47015eae466d1723832480cfa08'))
+        #print '            '+binascii.hexlify(long_to_bytes(self.S))
+        self.K     = hash_class( long_to_bytes(self.S) ).digest()
+        #print 'Expected K: 3c077b57b6b8c5edef10d2ee5cec99e66ab11586452254b7c7944f8380125517'
+        #print '            '+binascii.hexlify((self.K))
         self.M     = calculate_M( hash_class, N, g, self.I, self.s, self.A, self.B, self.K )
         self.H_AMK = calculate_H_AMK(hash_class, self.A, self.M, self.K)
         
