@@ -47,7 +47,6 @@ setup(name             = 'srp',
       provides         = ['srp'],
       packages         = ['srp'],
       package_data     = {'srp' : ['doc/*.rst', 'doc/*.py']},
-      ext_modules      = ext_modules,
       license          = "MIT",
       platforms        = "OS Independent",
       classifiers      = [
